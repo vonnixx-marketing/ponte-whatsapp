@@ -3,7 +3,10 @@
 // mensagens 1:1 enviadas e recebidas A PARTIR DA CONEXÃO. Nunca envia mensagens,
 // nunca marca como lida e não aparece "online" — o celular continua funcionando normalmente.
 //
-// Uso: npm start  →  abra http://localhost:3777 para conectar os números.
+// Modo computador: npm start  →  abra http://localhost:3777
+// Modo online (Railway etc.): defina CHAVE_SECRETA e DADOS_DIR. O painel pede senha
+// (usuário "admin" + CHAVE_SECRETA) e o conector do Claude responde em /mcp com
+// o cabeçalho "Authorization: Bearer CHAVE_SECRETA".
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -11,9 +14,14 @@ import crypto from 'node:crypto'
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, Browsers, fetchLatestBaileysVersion } from '@whiskeysockets/baileys'
 import QRCode from 'qrcode'
 import pino from 'pino'
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
+import { criarServidorMcp } from './ferramentas.js'
 import { SESSOES, DADOS, garantirPastas, lerLinhas, gravarLinhas, gravarEstado, criarGravador } from './armazem.js'
 
-const PORTA = Number(process.env.PORTA || 3777)
+const CHAVE = (process.env.CHAVE_SECRETA || '').trim()
+const ONLINE = !!CHAVE
+const PORTA = Number(process.env.PORT || process.env.PORTA || 3777)
+if (ONLINE && CHAVE.length < 24) { console.error('CHAVE_SECRETA precisa ter pelo menos 24 caracteres.'); process.exit(1) }
 const logger = pino({ level: process.env.LOG || 'warn' })
 
 garantirPastas()
@@ -224,20 +232,66 @@ ${itens}
 </main></body></html>`
 }
 
+function iguais(a, b) {
+  const x = Buffer.from(String(a)), y = Buffer.from(String(b))
+  return x.length === y.length && crypto.timingSafeEqual(x, y)
+}
+/** Painel: no modo online exige usuário "admin" e senha = CHAVE_SECRETA. */
+function painelAutorizado(req) {
+  if (!ONLINE) return true
+  const h = req.headers.authorization || ''
+  if (!h.startsWith('Basic ')) return false
+  const [u, ...resto] = Buffer.from(h.slice(6), 'base64').toString().split(':')
+  return u === 'admin' && iguais(resto.join(':'), CHAVE)
+}
+/** Conector: aceita "Authorization: Bearer CHAVE" ou "X-Api-Key: CHAVE". */
+function mcpAutorizado(req) {
+  if (!ONLINE) return true
+  const h = req.headers.authorization || ''
+  const k = h.startsWith('Bearer ') ? h.slice(7).trim() : String(req.headers['x-api-key'] || '')
+  return !!k && iguais(k, CHAVE)
+}
+function lerJsonCorpo(req) {
+  return new Promise((res, rej) => {
+    let b = ''
+    req.on('data', c => { b += c; if (b.length > 1e6) { rej(new Error('corpo grande demais')); req.destroy() } })
+    req.on('end', () => { try { res(b ? JSON.parse(b) : undefined) } catch (e) { rej(e) } })
+  })
+}
+async function atenderMcp(req, res) {
+  if (!mcpAutorizado(req)) { res.writeHead(401, { 'Content-Type': 'application/json' }); return res.end('{"error":"chave inválida"}') }
+  if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }); return res.end() }
+  const corpo = await lerJsonCorpo(req)
+  const servidor = criarServidorMcp()
+  const transporte = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true })
+  res.on('close', () => { transporte.close(); servidor.close() })
+  await servidor.connect(transporte)
+  await transporte.handleRequest(req, res, corpo)
+}
+
 function lerCorpo(req) {
   return new Promise(res => { let b = ''; req.on('data', c => { b += c; if (b.length > 1e4) req.destroy() }); req.on('end', () => res(new URLSearchParams(b))) })
 }
 const servidor = http.createServer(async (req, res) => {
   const voltar = () => { res.writeHead(303, { Location: '/' }); res.end() }
   try {
+    const rota = req.url.split('?')[0]
+    if (rota === '/saude') { res.writeHead(200); return res.end('ok') }
+    if (rota === '/mcp') return await atenderMcp(req, res)
+    if (!painelAutorizado(req)) {
+      res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Ponte WhatsApp", charset="UTF-8"', 'Content-Type': 'text/plain; charset=utf-8' })
+      return res.end('Acesso restrito. Usuário: admin · Senha: a CHAVE_SECRETA configurada.')
+    }
     if (req.method === 'GET' && req.url === '/') { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end(pagina()) }
     if (req.method === 'POST' && req.url === '/adicionar') { const f = await lerCorpo(req); const nome = (f.get('nome') || '').trim(); if (nome) await novaLinha(nome); return voltar() }
     const m = req.url.match(/^\/(remover|reconectar)\/(w[0-9a-f]+)$/)
     if (req.method === 'POST' && m) { await (m[1] === 'remover' ? removerLinha(m[2]) : reconectar(m[2])); return voltar() }
     res.writeHead(404); res.end('Não encontrado')
-  } catch (e) { logger.error(e); res.writeHead(500); res.end('Erro: ' + e.message) }
+  } catch (e) { logger.error(e); if (!res.headersSent) { res.writeHead(500); res.end('Erro: ' + e.message) } }
 })
-servidor.listen(PORTA, '127.0.0.1', () => console.log(`Ponte ligada. Abra http://localhost:${PORTA} para conectar os números.`))
+servidor.listen(PORTA, process.env.HOST || (ONLINE ? '0.0.0.0' : '127.0.0.1'), () => console.log(ONLINE
+  ? `Ponte online na porta ${PORTA}. Painel em / (usuário admin) e conector em /mcp.`
+  : `Ponte ligada. Abra http://localhost:${PORTA} para conectar os números.`))
 
 setInterval(batimento, 20_000)
 batimento()

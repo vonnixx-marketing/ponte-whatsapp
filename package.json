@@ -1,0 +1,19 @@
+{
+  "name": "ponte-whatsapp-mkt",
+  "version": "1.0.0",
+  "description": "Ponte somente leitura entre as linhas de WhatsApp do time de marketing e a Central de Conversas MKT no Claude",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node ponte.js",
+    "mcp": "node mcp.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "pino": "9.6.0",
+    "qrcode": "1.5.4",
+    "zod": "3.25.76"
+  }
+}
